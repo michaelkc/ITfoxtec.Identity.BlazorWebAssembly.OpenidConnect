@@ -15,5 +15,6 @@ namespace ITfoxtec.Identity.BlazorWebAssembly.OpenidConnect
         public string SessionState { get; set; }
         public string OidcDiscoveryUri { get; set; }
         public string ClientId { get; set; }
+        public Dictionary<string, ResourceAccessToken> AccessTokens { get; set; }
     }
 }

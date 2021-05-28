@@ -16,6 +16,7 @@ using System.Net.Http;
 using System.Security;
 using System.Security.Claims;
 using System.Threading.Tasks;
+using ITfoxtec.Identity.BlazorWebAssembly.OpenidConnect.Models;
 
 namespace ITfoxtec.Identity.BlazorWebAssembly.OpenidConnect
 {
@@ -66,17 +67,25 @@ namespace ITfoxtec.Identity.BlazorWebAssembly.OpenidConnect
                 };
 
                 var requestDictionary = authenticationRequest.ToDictionary().AddToDictionary(codeChallengeRequest);
-                if(openidClientPkceSettings.Resources?.Count() > 0)
+                var primaryResource = openidClientPkceSettings.Resources?.FirstOrDefault();
+                var secondaryResources = openidClientPkceSettings.Resources?.Skip(1).ToArray() ?? new string[0];
+                if (primaryResource != null)
                 {
                     var resourceRequest = new ResourceRequest
                     {
-                        Resources = openidClientPkceSettings.Resources
+                        Resources = new[] { primaryResource }
                     };
                     requestDictionary = requestDictionary.AddToDictionary(resourceRequest);
                 }
 
                 var oidcDiscovery = await GetOidcDiscoveryAsync(openidClientPkceSettings.OidcDiscoveryUri);
                 var authorizationUri = QueryHelpers.AddQueryString(oidcDiscovery.AuthorizationEndpoint, requestDictionary);
+                foreach (var resource in secondaryResources)
+                {
+                    authorizationUri = QueryHelpers.AddQueryString(authorizationUri, "resource", resource);
+
+                }
+
                 navigationManager.NavigateTo(authorizationUri, true);
 
             }
@@ -88,7 +97,7 @@ namespace ITfoxtec.Identity.BlazorWebAssembly.OpenidConnect
 
         private void ValidateResponseMode(string responseMode)
         {
-            if(responseMode != IdentityConstants.ResponseModes.Fragment && responseMode != IdentityConstants.ResponseModes.Query)
+            if (responseMode != IdentityConstants.ResponseModes.Fragment && responseMode != IdentityConstants.ResponseModes.Query)
             {
                 throw new NotSupportedException($"Response mode {responseMode} not supported. Only fragment and query is supported.");
             }
@@ -106,13 +115,14 @@ namespace ITfoxtec.Identity.BlazorWebAssembly.OpenidConnect
                 var openidClientPkceState = await GetState(authenticationResponse.State);
                 if (openidClientPkceState != null)
                 {
-                    (var idTokenPrincipal, var tokenResponse) = await AcquireTokensAsync(openidClientPkceState, authenticationResponse.Code);
+                    (var idTokenPrincipal, var tokenResponses, var unusedRefreshToken) = await AcquireTokensAsync(openidClientPkceState, authenticationResponse.Code);
 
                     var sessionResponse = responseQuery.ToObject<SessionResponse>();
                     sessionResponse.Validate();
 
-                    var validUntil = DateTimeOffset.UtcNow.AddSeconds(tokenResponse.ExpiresIn.HasValue ? tokenResponse.ExpiresIn.Value : 0).AddSeconds(-globalOpenidClientPkceSettings.TokensExpiresBefore);
-                    await (authenticationStateProvider as OidcAuthenticationStateProvider).CreateSessionAsync(validUntil, idTokenPrincipal, tokenResponse, sessionResponse.SessionState, openidClientPkceState);
+                    // TODO: FixMe 
+                    //var validUntil = DateTimeOffset.UtcNow.AddSeconds(tokenResponse.ExpiresIn.HasValue ? tokenResponse.ExpiresIn.Value : 0).AddSeconds(-globalOpenidClientPkceSettings.TokensExpiresBefore);
+                    await (authenticationStateProvider as OidcAuthenticationStateProvider).CreateSessionAsync(idTokenPrincipal, sessionResponse.SessionState, openidClientPkceState, tokenResponses, unusedRefreshToken);
                     navigationManager.NavigateTo(openidClientPkceState.RedirectUri, true);
                 }
             }
@@ -122,7 +132,7 @@ namespace ITfoxtec.Identity.BlazorWebAssembly.OpenidConnect
             }
         }
 
-        private async Task<(ClaimsPrincipal idTokenPrincipal, TokenResponse tokenResponse)> AcquireTokensAsync(OpenidConnectPkceState openidClientPkceState, string code)
+        private async Task<(ClaimsPrincipal idTokenPrincipal, Dictionary<string,TokenResponse> resourceTokenResponses, string unusedRefreshToken)> AcquireTokensAsync(OpenidConnectPkceState openidClientPkceState, string code)
         {
             var tokenRequest = new TokenRequest
             {
@@ -140,15 +150,21 @@ namespace ITfoxtec.Identity.BlazorWebAssembly.OpenidConnect
             var oidcDiscovery = await GetOidcDiscoveryAsync(openidClientPkceState.OidcDiscoveryUri);
 
             var requestDictionary = tokenRequest.ToDictionary().AddToDictionary(codeVerifierSecret);
-            if (openidClientPkceState.Resources?.Count() > 0)
+
+            var primaryResource = openidClientPkceState.Resources?.FirstOrDefault();
+            var secondaryResources = openidClientPkceState.Resources?.Skip(1).ToArray() ?? new string[0];
+
+            if (primaryResource != null)
             {
                 var resourceRequest = new ResourceRequest
                 {
-                    Resources = openidClientPkceState.Resources
+                    Resources = new []{primaryResource}
                 };
                 requestDictionary = requestDictionary.AddToDictionary(resourceRequest);
             }
 
+            var responses = new Dictionary<string, TokenResponse>();
+            var unusedRefreshToken = (string)null;
             var request = new HttpRequestMessage(HttpMethod.Post, oidcDiscovery.TokenEndpoint);
             request.Content = new FormUrlEncodedContent(requestDictionary);
 
@@ -161,7 +177,7 @@ namespace ITfoxtec.Identity.BlazorWebAssembly.OpenidConnect
                     tokenResponse.Validate(true);
                     if (tokenResponse.AccessToken.IsNullOrEmpty()) throw new ArgumentNullException(nameof(tokenResponse.AccessToken), tokenResponse.GetTypeName());
                     if (tokenResponse.ExpiresIn <= 0) throw new ArgumentNullException(nameof(tokenResponse.ExpiresIn), tokenResponse.GetTypeName());
-
+                    unusedRefreshToken = tokenResponse.RefreshToken;
                     var oidcDiscoveryKeySet = await GetOidcDiscoveryKeysAsync(openidClientPkceState.OidcDiscoveryUri);
 
                     // .NET 5.0 error, System.Security.Cryptography.RSA.Create() - System.PlatformNotSupportedException: System.Security.Cryptography.Algorithms is not supported on this platform.
@@ -181,7 +197,26 @@ namespace ITfoxtec.Identity.BlazorWebAssembly.OpenidConnect
                         throw new SecurityException("Nonce do not match.");
                     }
 
-                    return (idTokenPrincipal, tokenResponse);
+                    responses.Add(primaryResource ?? "", tokenResponse);
+
+                    foreach (var resource in secondaryResources)
+                    {
+                        Console.WriteLine(
+                            $"Would have refresh tokened with {tokenResponse.RefreshToken} for {resource}");
+                        var subject =
+                            SubjectFromClaims(idTokenPrincipal.Claims.Select(c => new ClaimValue {Type = c.Type, Value = c.Value}));
+                        var secondaryTokenResponsePair =
+                            await this.AcquireRefreshTokensAsync(
+                                openidClientPkceState.OidcDiscoveryUri,
+                                openidClientPkceState.ClientId,
+                                subject,
+                                unusedRefreshToken,
+                                resource);
+                        responses.Add(resource, secondaryTokenResponsePair.tokenResponse);
+                        unusedRefreshToken = secondaryTokenResponsePair.tokenResponse.RefreshToken;
+                    }
+
+                    return (idTokenPrincipal, responses, unusedRefreshToken);
 
                 case HttpStatusCode.BadRequest:
                     var resultBadRequest = await response.Content.ReadAsStringAsync();
@@ -194,11 +229,17 @@ namespace ITfoxtec.Identity.BlazorWebAssembly.OpenidConnect
             }
         }
 
+        private string SubjectFromClaims(IEnumerable<ClaimValue> claims) =>
+            claims
+                .Where(c => c.Type == globalOpenidClientPkceSettings.NameClaimType)
+                .Select(c => c.Value)
+                .SingleOrDefault();
+
         public async Task<OidcUserSession> HandleRefreshTokenAsync(OidcUserSession userSession)
         {
             if (!userSession.RefreshToken.IsNullOrEmpty() && userSession.ValidUntil < DateTimeOffset.UtcNow.AddSeconds(globalOpenidClientPkceSettings.TokensExpiresBefore))
             {
-                var subject = userSession.Claims.Where(c => c.Type == globalOpenidClientPkceSettings.NameClaimType).Select(c => c.Value).SingleOrDefault();
+                var subject = SubjectFromClaims(userSession.Claims);
                 (var idTokenPrincipal, var tokenResponse) = await AcquireRefreshTokensAsync(userSession.OidcDiscoveryUri, userSession.ClientId, subject, userSession.RefreshToken);
 
                 var validUntil = DateTimeOffset.UtcNow.AddSeconds(tokenResponse.ExpiresIn.HasValue ? tokenResponse.ExpiresIn.Value : 0).AddSeconds(-globalOpenidClientPkceSettings.TokensExpiresBefore);
@@ -208,7 +249,7 @@ namespace ITfoxtec.Identity.BlazorWebAssembly.OpenidConnect
             return userSession;
         }
 
-        private async Task<(ClaimsPrincipal idTokenPrincipal, TokenResponse tokenResponse)> AcquireRefreshTokensAsync(string oidcDiscoveryUri, string clientId, string subject, string refreshToken)
+        private async Task<(ClaimsPrincipal idTokenPrincipal, TokenResponse tokenResponse)> AcquireRefreshTokensAsync(string oidcDiscoveryUri, string clientId, string subject, string refreshToken, string resource = null)
         {
             var tokenRequest = new TokenRequest
             {
@@ -220,7 +261,12 @@ namespace ITfoxtec.Identity.BlazorWebAssembly.OpenidConnect
             var oidcDiscovery = await GetOidcDiscoveryAsync(oidcDiscoveryUri);
 
             var request = new HttpRequestMessage(HttpMethod.Post, oidcDiscovery.TokenEndpoint);
-            request.Content = new FormUrlEncodedContent(tokenRequest.ToDictionary());
+            var requestBodyDictionary = tokenRequest.ToDictionary();
+            if (resource != null)
+            {
+                requestBodyDictionary.Add("resource",resource);
+            }
+            request.Content = new FormUrlEncodedContent(requestBodyDictionary);
 
             var response = await GetHttpClient().SendAsync(request);
             switch (response.StatusCode)
@@ -298,7 +344,7 @@ namespace ITfoxtec.Identity.BlazorWebAssembly.OpenidConnect
                 var state = await SaveStateAsync(openidClientPkceSettings, logoutCallBackUri, navigationManager.BaseUri);
 
                 var idTokenHint = await (authenticationStateProvider as OidcAuthenticationStateProvider).GetIdToken(readInvalidSession: true);
-                if(idTokenHint.IsNullOrEmpty())
+                if (idTokenHint.IsNullOrEmpty())
                 {
                     navigationManager.NavigateTo(logoutCallBackUri, true);
                 }
@@ -343,7 +389,7 @@ namespace ITfoxtec.Identity.BlazorWebAssembly.OpenidConnect
 
         private Dictionary<string, string> GetResponseQuery(string responseUrl)
         {
-            var rUri = new Uri(responseUrl);                        
+            var rUri = new Uri(responseUrl);
             if (rUri.Query.IsNullOrWhiteSpace() && rUri.Fragment.IsNullOrWhiteSpace())
             {
                 throw new SecurityException("Invalid response URL.");
